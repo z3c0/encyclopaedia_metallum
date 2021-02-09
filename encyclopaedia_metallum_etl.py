@@ -18,7 +18,7 @@ from threading import Thread
 
 ALPHABET = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
             'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
-            'NBR', '~']
+            'NBR', '~']  # the alphabet, according to metal archives
 
 METAL_ARCHIVES_ROOT = 'www.metal-archives.com'
 USER_AGENT_STR = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:78.0) '
@@ -31,8 +31,8 @@ NUMBER_OF_THREADS = multiprocessing.cpu_count()
 
 
 def _create_metallum_api_endpoint(letter, offset):
-    '''returns an API endpoint for retrieving a segment of bands
-    beginnging with the given letter'''
+    """Returns an API endpoint for retrieving a segment of bands
+    beginnging with the given letter"""
 
     endpoint = f'browse/ajax-letter/l/{letter}/json'
     query_string = \
@@ -42,13 +42,14 @@ def _create_metallum_api_endpoint(letter, offset):
 
 
 def download_all_bands():
-    """Get every band from Encyclopaedia Metallum"""
+    """Get every band from Encyclopaedia Metallum using the website API"""
     bands = list()
     bands_view = dict()
     bands_screen = curses.initscr()
     threading = True
 
     def _update_view(letter, message):
+        """Textually output progress"""
         bands_view[letter] = message
         bands_screen.clear()
         for index, (key, value) in enumerate(bands_view.items()):
@@ -57,8 +58,9 @@ def download_all_bands():
         bands_screen.refresh()
 
     def _get_metallum_records_by_letter(letter):
-        '''Returns metal bands beginning with the given letter'''
+        """Returns metal bands beginning with the given letter"""
 
+        # the HTML headers that metal archives demands
         headers = {
             'Accept': ('text/html,' +
                        'application/xhtml+xml,' +
@@ -74,47 +76,61 @@ def download_all_bands():
 
         offset = 0
 
+        # retrieve the first batch
         endpoint = _create_metallum_api_endpoint(letter, offset)
         band_data = requests.get(endpoint, headers=headers)
         band_json = json.loads(band_data.text)
 
+        # determine total records to be determined
         total_records = int(band_json['iTotalRecords'])
         records = list(band_json['aaData'])
 
+        # load the remainder of data until the records loaded
+        # matches the total number of records specified in the
+        # first call
         while offset < total_records:
-            time.sleep(2)
+            time.sleep(1)  # wait a second, to be courteous
 
+            # update view with progress
             record_range = \
                 f'{offset}-{min(offset + BATCH_SIZE, total_records)}'
-            message = f'Downloading {record_range} of {total_records}...'
+            message = f'downloading {record_range} of {total_records}...'
             _update_view(letter, message)
 
+            # get the next batch
             offset += BATCH_SIZE
             attempts = 0
             endpoint = _create_metallum_api_endpoint(letter, offset)
-            band_data = requests.get(endpoint, headers=headers)
 
+            # what does metal archives' web server know?
+            # does it know things?
+            # lets find out
+            band_data = requests.get(endpoint, headers=headers)
             if band_data.status_code == 200:
+                # it does know things
                 band_json = json.loads(band_data.text)
             elif attempts < MAX_ATTEMPTS:
                 attempts += 1
                 offset -= BATCH_SIZE
             else:
+                # it does NOT know things
                 raise Exception(f'{band_json.status_code} error')
 
             records = records + band_json['aaData']
 
         return records
 
+    # threadable funtion that reads letters from a queue (q) and then
+    # retrieves the metal bands beginning with each returned letter
     def _download_by_letter_concurrently():
         while threading:
             letter = q.get()
             if letter:
-                _update_view(letter, 'Starting download...')
+                _update_view(letter, 'starting download...')
                 bands_data = _get_metallum_records_by_letter(letter)
                 for datum in bands_data:
                     bands.append(datum)
-                _update_view(letter, 'Download complete')
+                _update_view(letter, 'download complete')
             q.task_done()
 
     q = PriorityQueue(NUMBER_OF_THREADS * 2)
@@ -124,28 +140,34 @@ def download_all_bands():
         t.start()
 
     try:
+        # add each letter to the queue
         for letter in ALPHABET:
             q.put(letter)
 
+        # block main thread until downloads are complete
         q.join()
     except KeyboardInterrupt:
         sys.exit(1)
 
+    # set threading to false and push empty values into queue
+    # this will cause the thread loops to exit, closing each thread
     threading = False
     for _ in range(NUMBER_OF_THREADS):
-        q.put(0)
+        q.put(0)  # priority queues require a sortable value
 
+    # dump data to a CSV
     bands_columns = ('band', 'country', 'genre', 'status')
     bands_df = pd.DataFrame(bands, columns=bands_columns)
     bands_df.to_csv('bands_raw.csv', index=False)
 
+    # close cureses window
     curses.endwin()
 
     print('bands downloaded')
 
 
 def clean_band_data():
-    """Clean"""
+    """Scrub HTML from band data"""
     bands_df = pd.read_csv('bands_raw.csv')
     bands = bands_df.to_records()
 
@@ -168,15 +190,13 @@ def clean_band_data():
 
 
 def download_band_details():
+    """Retrieves discographies for the bands in bands.csv"""
     bands_df = pd.read_csv('bands.csv')
     album_data = []
 
+    # construct endpoints for each bands discography
     discography_urls = []
-
-    columns = ['band_id', 'name', 'url']
-
-    for _, row in bands_df[columns].iterrows():
-        band_id, band_name = row['band_id'], row['name']
+    for _, band_id, band_name in bands_df[['band_id', 'name']]:
         endpoint = f'band/discography/id/{band_id}/tab/all'
         discography_url = f'https://www.metal-archives.com/{endpoint}'
         discography_urls.append((band_id, band_name, discography_url))
@@ -186,52 +206,58 @@ def download_band_details():
 
     threading = True
 
-    print('downloading discographies...', end='')
-
     def _update_view():
         print(f'\rprocessed {len(processed_urls)} of {total_urls}', end='')
+
+    def _download_band_discography(band_id, band_name, discography_url):
+        band_webpage = None
+        max_attempts = 3
+        attempts = 0
+        while attempts < max_attempts:
+            try:
+                band_webpage = requests.get(discography_url)
+            except Exception:
+                if attempts < max_attempts:
+                    time.sleep(120)
+                    attempts += 1
+                    continue
+                continue
+            break
+
+        band_soup = bs.BeautifulSoup(band_webpage.text, 'html.parser')
+        band_disco_soup = band_soup.find_all('tr')[1:]
+
+        album_records = []
+        for table_row in band_disco_soup:
+            table_data = table_row.find_all('td')
+
+            album_link = table_data[0].a
+            if not album_link:
+                break
+
+            album_url = album_link['href']
+            album_name = album_link.text
+            album_id = album_url.split('/')[-1]
+
+            album_type = table_data[1].text
+
+            year = table_data[2].text
+
+            review = table_data[3].text.strip()
+            record = (band_id, band_name, album_id, album_name,
+                      album_type, year, review, album_url)
+            album_records.append(record)
+
+        return album_records
 
     def _get_albumns_concurrently():
         while threading:
             band_data = q.get()
             if band_data:
-                band_id, band_name, discography_url = band_data
+                _, _, discography_url = band_data
+                album_records = _download_band_discography(*band_data)
 
-                band_webpage = None
-                max_attempts = 3
-                attempts = 0
-                while attempts < max_attempts:
-                    try:
-                        band_webpage = requests.get(discography_url)
-                    except Exception:
-                        if attempts < max_attempts:
-                            time.sleep(120)
-                            attempts += 1
-                            continue
-                        continue
-                    break
-
-                band_soup = bs.BeautifulSoup(band_webpage.text, 'html.parser')
-                band_disco_soup = band_soup.find_all('tr')[1:]
-
-                for table_row in band_disco_soup:
-                    table_data = table_row.find_all('td')
-
-                    album_link = table_data[0].a
-                    if not album_link:
-                        break
-
-                    album_url = album_link['href']
-                    album_name = album_link.text
-                    album_id = album_url.split('/')[-1]
-
-                    album_type = table_data[1].text
-
-                    year = table_data[2].text
-
-                    review = table_data[3].text.strip()
-                    record = (band_id, band_name, album_id, album_name,
-                              album_type, year, review, album_url)
+                for record in album_records:
                     album_data.append(record)
 
                 processed_urls.append(discography_url)
@@ -254,7 +280,7 @@ def download_band_details():
 
     threading = False
     for _ in range(NUMBER_OF_THREADS):
-        q.put(0)
+        q.put(None)
 
     album_headers = ('band_id', 'band_name', 'album_id', 'album_name',
                      'album_type', 'year', 'review', 'album_url')
@@ -273,9 +299,8 @@ def download_all_tracks():
     urls_processed = []
     failed_urls = []
 
-    class AlbumRequestException(Exception):
-        """A special error"""
-
+    # check to see if any data has already been downloaded
+    # if so, continue off of that
     try:
         processed_tracks_df = pd.read_csv('tracks.csv')
         urls_processed = list(processed_tracks_df['album_url'].unique())
@@ -293,6 +318,7 @@ def download_all_tracks():
         pass
 
     def _update_view(close=False):
+        """Textual output"""
         if close:
             print('\ntracks downloaded')
         else:
@@ -305,6 +331,7 @@ def download_all_tracks():
             print('\r' + message, end='')
 
     def _save_records():
+        """Save data and record which bands caused errors"""
         tracks = copy.deepcopy(downloaded_tracks)
         tracks_df = pd.DataFrame(tracks)
         tracks_df.columns = ('band_id', 'band_name', 'album_id', 'album_name',
@@ -318,6 +345,12 @@ def download_all_tracks():
 
         tracks_df.to_csv('tracks.csv', index=False)
         failed_records_df.to_csv('failed_album_urls.csv', index=False)
+
+    # the next two functions use this special error to handle issues
+    # with parsing album data. albums that throw this error get stored
+    # for further analysis.
+    class AlbumParseException(Exception):
+        """A special error"""
 
     def _get_album_tracks(album):
         url = album['album_url']
@@ -339,7 +372,7 @@ def download_all_tracks():
             track_records = [[td.text.strip() for td in tr.find_all('td')]
                              for tr in track_soup]
         except Exception:
-            raise AlbumRequestException()
+            raise AlbumParseException()
 
         tracks = list(map(lambda n: n[1].replace('\n', ' '), track_records))
         track_numbers = \
@@ -366,7 +399,7 @@ def download_all_tracks():
                     time.sleep(1)  # wait a sec, to be courteous
                     try:
                         tracks = _get_album_tracks(album_data)
-                    except AlbumRequestException:
+                    except AlbumParseException:
                         failed_urls.append(album_data)
                     else:
                         for track in tracks:
