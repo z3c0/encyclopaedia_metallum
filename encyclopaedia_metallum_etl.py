@@ -89,8 +89,6 @@ def download_all_bands():
         # matches the total number of records specified in the
         # first call
         while offset < total_records:
-            time.sleep(1)  # wait a second, to be courteous
-
             # update view with progress
             record_range = \
                 f'{offset}-{min(offset + BATCH_SIZE, total_records)}'
@@ -155,7 +153,7 @@ def download_all_bands():
     for _ in range(NUMBER_OF_THREADS):
         q.put(0)  # priority queues require a sortable value
 
-    # dump data to a CSV
+    # dump raw data to a CSV
     bands_columns = ('band', 'country', 'genre', 'status')
     bands_df = pd.DataFrame(bands, columns=bands_columns)
     bands_df.to_csv('bands_raw.csv', index=False)
@@ -163,12 +161,7 @@ def download_all_bands():
     # close cureses window
     curses.endwin()
 
-    print('bands downloaded')
-
-
-def clean_band_data():
-    """Scrub HTML from band data"""
-    bands_df = pd.read_csv('bands_raw.csv')
+    # clean band data
     bands = bands_df.to_records()
 
     clean_records = []
@@ -184,7 +177,8 @@ def clean_band_data():
 
         clean_records.append((band_id, name, genre, country, band_status, url))
 
-    band_columns = ('band_id', 'name', 'genre', 'country', 'status', 'url')
+    band_columns = ('metallum_band_id', 'name', 'genre', 'country', 'status',
+                    'url')
     clean_df = pd.DataFrame(clean_records, columns=band_columns)
     clean_df.to_csv('bands.csv', index=False)
 
@@ -282,15 +276,16 @@ def download_band_details():
     for _ in range(NUMBER_OF_THREADS):
         q.put(None)
 
-    album_headers = ('band_id', 'band_name', 'album_id', 'album_name',
-                     'album_type', 'year', 'review', 'album_url')
+    album_headers = ('metallum_band_id', 'band_name', 'metallum_album_id',
+                     'album_name', 'album_type', 'year', 'review', 'album_url')
     albums_df = pd.DataFrame(album_data, columns=album_headers)
     albums_df.to_csv('albums.csv', index=False)
 
 
 def download_all_tracks():
     albums_df = pd.read_csv('albums.csv')
-    selection = ['band_id', 'band_name', 'album_id', 'album_name', 'album_url']
+    selection = ['metallum_band_id', 'band_name', 'metallum_album_id',
+                 'album_name', 'album_url']
     album_data = albums_df[selection]
 
     threading = True
@@ -396,7 +391,6 @@ def download_all_tracks():
             if album_data is not None:
                 album_url = album_data['album_url']
                 if album_url not in urls_processed:
-                    time.sleep(1)  # wait a sec, to be courteous
                     try:
                         tracks = _get_album_tracks(album_data)
                     except AlbumParseException:
@@ -432,9 +426,8 @@ def download_all_tracks():
 
 
 def download_data():
-    # download_all_bands()
-    # clean_band_data()
-    # download_band_details()
+    download_all_bands()
+    download_band_details()
     download_all_tracks()
 
 

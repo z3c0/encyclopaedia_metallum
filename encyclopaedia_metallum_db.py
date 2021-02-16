@@ -1,5 +1,6 @@
 import re
 import pandas as pd
+import itertools as it
 
 from sqlalchemy import create_engine
 from decouple import config
@@ -19,7 +20,8 @@ def load_bands():
                         'band_status', 'band_url')
 
     bands_df.index.name = 'band_id'
-
+    bands_df = bands_df.drop_duplicates()
+    bands_df = bands_df.convert_dtypes()
     bands_df.to_sql('bands', mysql_conn, if_exists='replace')
 
 
@@ -30,21 +32,79 @@ def load_albums():
                          'album_url')
 
     albums_df.index.name = 'album_id'
-
+    albums_df = albums_df.drop_duplicates()
+    albums_df = albums_df.convert_dtypes()
     albums_df.to_sql('albums', mysql_conn, if_exists='replace')
 
 
 def load_countries():
     bands_df = pd.read_sql('bands', mysql_conn)
     unique_countries = bands_df['country'].unique()
-    country_records = [[c] for c in unique_countries]
-    country_records.sort()
-    country_df = pd.DataFrame(country_records, columns=['country_name'])
+    unique_countries.sort()
+    country_df = pd.DataFrame(unique_countries, columns=['country_name'])
     country_df.index.name = 'country_id'
     country_df.to_sql('countries', mysql_conn, if_exists='replace')
 
 
-def process_genres():
+def load_genres():
+    band_genres_df = pd.read_sql('band_genres', mysql_conn)
+    unique_genres = band_genres_df['genre_name'].unique()
+    unique_genres.sort()
+    genre_df = pd.DataFrame(unique_genres, columns=['genre_name'])
+    genre_df.index.name = 'genre_id'
+    genre_df.to_sql('genres', mysql_conn, if_exists='replace')
+
+
+def load_tracks():
+    def track_generator(page_size):
+        file = open('tracks.csv', 'r', encoding='utf-8')
+
+        line = file.readline()
+        columns = line.strip().split(',')
+
+        row_count = 0
+        for _ in file:
+            row_count += 1
+
+        file.close()
+
+        max_index = 0
+
+        while max_index < row_count:
+            kwargs = {'skiprows': max_index + 1, 'nrows': page_size}
+            page_df = pd.read_csv('tracks.csv', **kwargs)
+            if page_df.empty:
+                break
+
+            page_df.columns = columns
+
+            page_df.index.name = 'track_id'
+
+            page_df.index = page_df.index + max_index
+
+            page_df['metallum_band_id'] = \
+                page_df['metallum_band_id'].astype('int64')
+
+            page_df['metallum_album_id'] = \
+                page_df['metallum_album_id'].astype('int64')
+
+            page_df['track_number'] = \
+                page_df['track_number'].astype('int32')
+
+            yield page_df
+
+            max_index = max(page_df.index) + 1
+
+    track_gen = track_generator(100000)
+
+    initial_load = next(track_gen)
+    initial_load.to_sql('tracks', mysql_conn, if_exists='replace')
+
+    for track_page in track_gen:
+        track_page.to_sql('tracks', mysql_conn, if_exists='append')
+
+
+def process_band_genres():
     bands_df = pd.read_sql('bands', mysql_conn)
     selection = ['band_id', 'genre']
     genre_df = bands_df[selection]
@@ -181,10 +241,12 @@ def process_genres():
     cleaned_genres_df = pd.DataFrame(cleaned_records)
     cleaned_genres_df.columns = ('band_id', 'genre_name', 'phase_name')
     cleaned_genres_df.index.name = 'band_genre_id'
+    cleaned_genres_df = cleaned_genres_df.drop_duplicates()
+    cleaned_genres_df = cleaned_genres_df.convert_dtypes()
     cleaned_genres_df.to_sql('band_genres', mysql_conn, if_exists='replace')
 
 
-def process_genre_changes():
+def process_band_genre_changes():
     genre_df = pd.read_sql('band_genres', mysql_conn)
 
     genre_phase_records = []
@@ -214,12 +276,62 @@ def process_genre_changes():
         genre_phase_records.append(record)
 
     genre_phase_df = pd.DataFrame(genre_phase_records)
+    genre_phase_df = genre_phase_df.drop_duplicates()
     genre_phase_df.columns = ('band_id', 'early_phase', 'mid_phase',
                               'later_phase')
 
 
+def process_genre_relationships():
+    band_genres_df = pd.read_sql('SELECT * FROM band_genres_vw', mysql_conn)
+
+    genre_permutations = list()
+    band_ids = band_genres_df['band_id'].unique()
+    for band_id in band_ids:
+        genres_df = band_genres_df[band_genres_df['band_id'] == band_id]
+        genre_relationships = list(it.permutations(genres_df['genre_id'], 2))
+        genre_permutations += genre_relationships
+
+    genre_permutations_cols = ('genre_id', 'related_genre_id')
+    genre_permutations_df = \
+        pd.DataFrame(genre_permutations, columns=genre_permutations_cols)
+    genre_permutations_df.index.name = 'genre_permutation_id'
+
+    genre_combos = list()
+    band_ids = band_genres_df['band_id'].unique()
+    for band_id in band_ids:
+        genres_df = band_genres_df[band_genres_df['band_id'] == band_id]
+        genre_relationships = list(it.combinations(genres_df['genre_id'], 2))
+        genre_combos += genre_relationships
+
+    genre_combos_cols = ('genre_id', 'related_genre_id')
+    genre_combos_df = \
+        pd.DataFrame(genre_combos, columns=genre_combos_cols)
+    genre_combos_df.index.name = 'genre_combination_id'
+
+    genre_combos_df.to_sql('genre_combos', mysql_conn,
+                           if_exists='replace')
+    genre_permutations_df.to_sql('genre_permutations', mysql_conn,
+                                 if_exists='replace')
+
+
 if __name__ == '__main__':
+    # print('loading bands...')
     # load_bands()
+
+    # print('loading albums...')
     # load_albums()
-    # process_genres()
-    process_genre_changes()
+
+    # print('loading tracks...')
+    # load_tracks()
+
+    # print('processing band genres...')
+    # process_band_genres()
+
+    # print('processing band genre changes...')
+    # process_band_genre_changes()
+
+    # print('loading genres...')
+    # load_genres()
+
+    print('processing genre relationships...')
+    process_genre_relationships()
