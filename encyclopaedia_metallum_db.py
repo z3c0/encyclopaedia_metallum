@@ -1,62 +1,75 @@
 import re
+import sys
+import multiprocessing as mp
 import pandas as pd
 import itertools as it
 
 from sqlalchemy import create_engine
 from decouple import config
+from queue import Queue
+from threading import Thread
+
 
 USER = config('USER')
 PASSWORD = config('PASSWORD')
 IP_ADDRESS = config('IP_ADDRESS')
 DATABASE = 'metallum'
 
+THREAD_MAX = mp.cpu_count()
+
 conn_str = f'mysql+pymysql://{USER}:{PASSWORD}@{IP_ADDRESS}/{DATABASE}'
 mysql_conn = create_engine(conn_str)
 
 
 def load_bands():
+    print('loading bands...')
     bands_df = pd.read_csv('bands.csv')
     bands_df.columns = ('metallum_band_id', 'band_name', 'genre', 'country',
                         'band_status', 'band_url')
 
-    bands_df.index.name = 'band_id'
+    bands_df.index.name = 'stg_band_id'
     bands_df = bands_df.drop_duplicates()
     bands_df = bands_df.convert_dtypes()
-    bands_df.to_sql('bands', mysql_conn, if_exists='replace')
+    bands_df.to_sql('stg_bands', mysql_conn, if_exists='replace')
 
 
 def load_albums():
+    print('loading albums...')
     albums_df = pd.read_csv('albums.csv')
     albums_df.columns = ('metallum_band_id', 'band_name', 'metallum_album_id',
                          'album_name', 'album_type', 'year', 'review',
                          'album_url')
 
-    albums_df.index.name = 'album_id'
+    albums_df.index.name = 'stg_album_id'
     albums_df = albums_df.drop_duplicates()
     albums_df = albums_df.convert_dtypes()
-    albums_df.to_sql('albums', mysql_conn, if_exists='replace')
+    albums_df.to_sql('stg_albums', mysql_conn, if_exists='replace')
 
 
 def load_countries():
-    bands_df = pd.read_sql('bands', mysql_conn)
+    print('loading countries...')
+    bands_df = pd.read_sql('stg_bands', mysql_conn)
     unique_countries = bands_df['country'].unique()
     unique_countries.sort()
     country_df = pd.DataFrame(unique_countries, columns=['country_name'])
-    country_df.index.name = 'country_id'
-    country_df.to_sql('countries', mysql_conn, if_exists='replace')
+    country_df.index.name = 'stg_country_id'
+    country_df.to_sql('stg_countries', mysql_conn, if_exists='replace')
 
 
 def load_genres():
-    band_genres_df = pd.read_sql('band_genres', mysql_conn)
+    print('loading genres...')
+    band_genres_df = pd.read_sql('stg_band_genres', mysql_conn)
     unique_genres = band_genres_df['genre_name'].unique()
     unique_genres.sort()
     genre_df = pd.DataFrame(unique_genres, columns=['genre_name'])
-    genre_df.index.name = 'genre_id'
-    genre_df.to_sql('genres', mysql_conn, if_exists='replace')
+    genre_df.index.name = 'stg_genre_id'
+    genre_df.to_sql('stg_genres', mysql_conn, if_exists='replace')
 
 
 def load_tracks():
-    def track_generator(page_size):
+    print('loading tracks...')
+
+    def _track_generator(page_size):
         file = open('tracks.csv', 'r', encoding='utf-8')
 
         line = file.readline()
@@ -78,7 +91,7 @@ def load_tracks():
 
             page_df.columns = columns
 
-            page_df.index.name = 'track_id'
+            page_df.index.name = 'stg_track_id'
 
             page_df.index = page_df.index + max_index
 
@@ -95,21 +108,95 @@ def load_tracks():
 
             max_index = max(page_df.index) + 1
 
-    track_gen = track_generator(100000)
+    track_gen = _track_generator(100000)
 
     initial_load = next(track_gen)
-    initial_load.to_sql('tracks', mysql_conn, if_exists='replace')
+    initial_load.to_sql('stg_tracks', mysql_conn, if_exists='replace')
 
     for track_page in track_gen:
-        track_page.to_sql('tracks', mysql_conn, if_exists='append')
+        track_page.to_sql('stg_tracks', mysql_conn, if_exists='append')
+
+
+def clean_genre(genre):
+    genre = genre.strip()
+
+    # normalize and removes spaces from common patterns
+    genre = re.sub(r' \'?n\'? ', '\'n\'', genre)
+    genre = re.sub(r'nu ', 'nu-', genre)
+    genre = re.sub(r'new ', 'new-', genre)
+    genre = re.sub(r'hard ', 'hard-', genre)
+    genre = re.sub(r'free ', 'free-', genre)
+    genre = re.sub(r'post ', 'post-', genre)
+    genre = re.sub(r'jazzy', 'jazz', genre)
+    genre = re.sub(r'pop rock', 'pop-rock', genre)
+    genre = re.sub(r'trip hop', 'trip-hop', genre)
+    genre = re.sub(r'cloud rap', 'cloud-rap', genre)
+    genre = re.sub(r'a cappella', 'a-cappela', genre)
+    genre = re.sub(r'bossa nova', 'bossa-nova', genre)
+    genre = re.sub(r'spoken word', 'spoken-word', genre)
+    genre = re.sub(r'film score', 'film-score', genre)
+    genre = re.sub(r'world music', 'world-music', genre)
+    genre = re.sub(r'middle eastern', 'middle-eastern', genre)
+    genre = re.sub(r'ethnic music', 'ethnic-music', genre)
+    genre = re.sub(r'game music', 'game-music', genre)
+    genre = re.sub(r'drum and bass', 'drum-and-bass', genre)
+    genre = re.sub(r'psychedellic rock', 'psychedellic-rock', genre)
+    genre = re.sub(r'power electronics', 'power-electronics', genre)
+    genre = re.sub(r'neue deutsche härte', 'neue-deutsche-härte', genre)
+
+    # turn "genre'n'roll" into "genre rock'n'roll"
+    genre = re.sub(r'(\S+)\'n\'roll', r"\g<1> rock'n'roll", genre)
+
+    genres = genre.split(' with ')
+    genres = list(set().union(*[g.split(' and ') for g in genres]))
+    genres = list(set().union(*[g.split('/') for g in genres]))
+
+    # finally, spaces
+    genres = list(set().union(*[g.split(' ') for g in genres]))
+
+    # final clean-up
+    clean_genres = list()
+    junk = ('', 'metal', 'elements', 'influences', 'music')
+    for genre in genres:
+        genre = genre.strip()
+
+        if genre.endswith('-'):
+            genre += 'metal'
+
+        # lump oddballs into their closest relatives
+        if genre == 'post':
+            genre = 'post-metal'
+
+        if genre == 'hard':
+            genre = 'hard-rock'
+
+        if genre == 'soft':
+            genre = 'soft-rock'
+
+        if genre == 'electronics':
+            genre = 'power-electronics'
+
+        if genre == 'atmoshpheric':
+            genre = 'atmospheric'
+
+        if genre == 'world':
+            genre = 'world-music'
+
+        if genre in junk:
+            continue
+
+        clean_genres.append(genre)
+
+    return clean_genres
 
 
 def process_band_genres():
-    bands_df = pd.read_sql('bands', mysql_conn)
-    selection = ['band_id', 'genre']
+    print('processing band genres...')
+    bands_df = pd.read_sql('stg_bands', mysql_conn)
+    selection = ['stg_band_id', 'genre']
     genre_df = bands_df[selection]
-    genre_df.columns = ('band_id', 'genre')
-    genre_df = genre_df.set_index('band_id')
+    genre_df.columns = ('stg_band_id', 'genre')
+    genre_df = genre_df.set_index('stg_band_id')
 
     # (first pass)
     # split genres by commas that aren't contained
@@ -168,92 +255,28 @@ def process_band_genres():
     # (third pass)
     # fix data issues
     cleaned_records = list()
-    junk = ('', 'metal', 'elements', 'influences', 'music')
     for band_index, genre, phase in processed_genre_phases:
-        genre = genre.strip()
-
-        # normalize and removes spaces from common patterns
-        genre = re.sub(r' \'?n\'? ', '\'n\'', genre)
-        genre = re.sub(r'nu ', 'nu-', genre)
-        genre = re.sub(r'new ', 'new-', genre)
-        genre = re.sub(r'hard ', 'hard-', genre)
-        genre = re.sub(r'free ', 'free-', genre)
-        genre = re.sub(r'post ', 'post-', genre)
-        genre = re.sub(r'jazzy', 'jazz', genre)
-        genre = re.sub(r'pop rock', 'pop-rock', genre)
-        genre = re.sub(r'trip hop', 'trip-hop', genre)
-        genre = re.sub(r'cloud rap', 'cloud-rap', genre)
-        genre = re.sub(r'a cappella', 'a-cappela', genre)
-        genre = re.sub(r'bossa nova', 'bossa-nova', genre)
-        genre = re.sub(r'spoken word', 'spoken-word', genre)
-        genre = re.sub(r'film score', 'film-score', genre)
-        genre = re.sub(r'world music', 'world-music', genre)
-        genre = re.sub(r'middle eastern', 'middle-eastern', genre)
-        genre = re.sub(r'ethnic music', 'ethnic-music', genre)
-        genre = re.sub(r'game music', 'game-music', genre)
-        genre = re.sub(r'drum and bass', 'drum-and-bass', genre)
-        genre = re.sub(r'psychedellic rock', 'psychedellic-rock', genre)
-        genre = re.sub(r'power electronics', 'power-electronics', genre)
-        genre = re.sub(r'neue deutsche härte', 'neue-deutsche-härte', genre)
-
-        # turn "genre'n'roll" into "genre rock'n'roll"
-        genre = re.sub(r'(\S+)\'n\'roll', r"\g<1> rock'n'roll", genre)
-
-        genres = genre.split(' with ')
-        genres = list(set().union(*[g.split(' and ') for g in genres]))
-        genres = list(set().union(*[g.split('/') for g in genres]))
-
-        # finally, spaces
-        genres = list(set().union(*[g.split(' ') for g in genres]))
-
-        # final clean-up
-        for genre in genres:
-            genre = genre.strip()
-
-            if genre.endswith('-'):
-                genre += 'metal'
-
-            # lump oddballs into their closest relatives
-            if genre == 'post':
-                genre = 'post-metal'
-
-            if genre == 'hard':
-                genre = 'hard-rock'
-
-            if genre == 'soft':
-                genre = 'soft-rock'
-
-            if genre == 'electronics':
-                genre = 'power-electronics'
-
-            if genre == 'atmoshpheric':
-                genre = 'atmospheric'
-
-            if genre == 'world':
-                genre = 'world-music'
-
-            if genre in junk:
-                continue
-
-            cleaned_record = (band_index, genre, phase)
-            cleaned_records.append(cleaned_record)
+        genres = clean_genre(genre)
+        cleaned_records += [(band_index, g, phase) for g in genres]
 
     cleaned_genres_df = pd.DataFrame(cleaned_records)
-    cleaned_genres_df.columns = ('band_id', 'genre_name', 'phase_name')
-    cleaned_genres_df.index.name = 'band_genre_id'
+    cleaned_genres_df.columns = ('stg_band_id', 'genre_name', 'phase_name')
+    cleaned_genres_df.index.name = 'stg_band_genre_id'
     cleaned_genres_df = cleaned_genres_df.drop_duplicates()
     cleaned_genres_df = cleaned_genres_df.convert_dtypes()
-    cleaned_genres_df.to_sql('band_genres', mysql_conn, if_exists='replace')
+    cleaned_genres_df.to_sql('stg_band_genres', mysql_conn,
+                             if_exists='replace')
 
 
 def process_band_genre_changes():
-    genre_df = pd.read_sql('band_genres', mysql_conn)
+    print('processing genre changes...')
+    genre_df = pd.read_sql('stg_band_genres', mysql_conn)
 
     genre_phase_records = []
 
-    band_ids = genre_df['band_id'].unique()
+    band_ids = genre_df['stg_band_id'].unique()
     for band_id in band_ids:
-        band_records = genre_df[genre_df['band_id'] == band_id]
+        band_records = genre_df[genre_df['stg_band_id'] == band_id]
 
         has_null_phases = pd.isnull(band_records['phase_name'])
         core_genre_records = band_records[has_null_phases]
@@ -277,7 +300,7 @@ def process_band_genre_changes():
 
     genre_phase_df = pd.DataFrame(genre_phase_records)
     genre_phase_df = genre_phase_df.drop_duplicates()
-    genre_phase_df.columns = ('band_id', 'early_phase', 'mid_phase',
+    genre_phase_df.columns = ('stg_band_id', 'early_phase', 'mid_phase',
                               'later_phase')
 
 
@@ -285,53 +308,114 @@ def process_genre_relationships():
     band_genres_df = pd.read_sql('SELECT * FROM band_genres_vw', mysql_conn)
 
     genre_permutations = list()
-    band_ids = band_genres_df['band_id'].unique()
+    band_ids = band_genres_df['stg_band_id'].unique()
     for band_id in band_ids:
-        genres_df = band_genres_df[band_genres_df['band_id'] == band_id]
-        genre_relationships = list(it.permutations(genres_df['genre_id'], 2))
+        genres_df = band_genres_df[band_genres_df['stg_band_id'] == band_id]
+        genre_relationships = \
+            list(it.permutations(genres_df['stg_genre_id'], 2))
         genre_permutations += genre_relationships
 
-    genre_permutations_cols = ('genre_id', 'related_genre_id')
+    genre_permutations_cols = ('stg_genre_id', 'related_stg_genre_id')
     genre_permutations_df = \
         pd.DataFrame(genre_permutations, columns=genre_permutations_cols)
-    genre_permutations_df.index.name = 'genre_permutation_id'
+    genre_permutations_df.index.name = 'stg_genre_permutation_id'
 
     genre_combos = list()
-    band_ids = band_genres_df['band_id'].unique()
+    band_ids = band_genres_df['stg_band_id'].unique()
     for band_id in band_ids:
-        genres_df = band_genres_df[band_genres_df['band_id'] == band_id]
-        genre_relationships = list(it.combinations(genres_df['genre_id'], 2))
+        genres_df = band_genres_df[band_genres_df['stg_band_id'] == band_id]
+        genre_relationships = \
+            list(it.combinations(genres_df['stg_genre_id'], 2))
         genre_combos += genre_relationships
 
-    genre_combos_cols = ('genre_id', 'related_genre_id')
+    genre_combos_cols = ('stg_genre_id', 'related_stg_genre_id')
     genre_combos_df = \
         pd.DataFrame(genre_combos, columns=genre_combos_cols)
-    genre_combos_df.index.name = 'genre_combination_id'
+    genre_combos_df.index.name = 'stg_genre_combination_id'
 
-    genre_combos_df.to_sql('genre_combos', mysql_conn,
+    genre_combos_df.to_sql('stg_genre_combos', mysql_conn,
                            if_exists='replace')
-    genre_permutations_df.to_sql('genre_permutations', mysql_conn,
+    genre_permutations_df.to_sql('stg_genre_permutations', mysql_conn,
                                  if_exists='replace')
 
 
+def apply_indexes():
+    with open('encyclopaedia_metallum_db.sql', 'r') as sql:
+        sql_text = sql.read()
+        clean_sql_text = sql_text.replace('\n', ' ')
+        sql_statements = [s + ';' for s in clean_sql_text.split(';')
+                          if s.strip() != '']
+        for statement in sql_statements:
+            mysql_conn.execute(statement)
+
+
+def process_concurrently(*args):
+    still_threading = True
+
+    def _process_funcs_concurrently():
+        while still_threading:
+            thread_func = q.get()
+            if thread_func:
+                thread_func()
+            q.task_done()
+
+    q = Queue(THREAD_MAX * 2)
+    for _ in range(THREAD_MAX):
+        process = Thread(target=_process_funcs_concurrently)
+        process.daemon = True
+        process.start()
+
+    try:
+        for func in args:
+            q.put(func)
+        q.join()
+    except KeyboardInterrupt:
+        still_threading = False
+        for _ in range(THREAD_MAX):
+            q.put(None)
+        sys.exit(1)
+        raise
+
+    still_threading = False
+    for _ in range(THREAD_MAX):
+        q.put(None)
+
+
+def process_data():
+    initial_load = [
+        load_bands,
+        load_albums,
+        load_tracks
+    ]
+
+    process_countries_and_band_genres = [
+        load_countries,
+        process_band_genres
+    ]
+
+    process_genres = [
+        load_genres,
+    ]
+
+    process_genre_permutations = [
+        process_genre_relationships
+    ]
+
+    post_deployment = [
+        apply_indexes
+    ]
+
+    pipline = [
+        initial_load,
+        process_countries_and_band_genres,
+        process_genres,
+        process_genre_permutations,
+        post_deployment
+    ]
+
+    for step in pipline:
+        process_concurrently(*step)
+
+
 if __name__ == '__main__':
-    # print('loading bands...')
-    # load_bands()
-
-    # print('loading albums...')
-    # load_albums()
-
-    # print('loading tracks...')
-    # load_tracks()
-
-    # print('processing band genres...')
-    # process_band_genres()
-
-    # print('processing band genre changes...')
-    # process_band_genre_changes()
-
-    # print('loading genres...')
-    # load_genres()
-
-    print('processing genre relationships...')
-    process_genre_relationships()
+    process_data()
