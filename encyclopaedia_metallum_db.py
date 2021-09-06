@@ -7,7 +7,7 @@ import itertools as it
 from sqlalchemy import create_engine
 from decouple import config
 from queue import Queue
-from threading import Thread
+from multiprocessing import Process
 
 
 USER = config('USER')
@@ -143,6 +143,16 @@ def clean_genre(genre):
     genre = re.sub(r'psychedellic rock', 'psychedellic-rock', genre)
     genre = re.sub(r'power electronics', 'power-electronics', genre)
     genre = re.sub(r'neue deutsche härte', 'neue-deutsche-härte', genre)
+
+    # convert genre fusions into multiple genres
+    genre = re.sub(r'deathgrind', 'death grind', genre)
+
+    # handle "core" genres
+    # eg "grindcore" -> "grind hardcore"
+    genre = re.sub(r'(\S+)core', r'\g<1> hardcore')
+
+    # the above will turn "hardcore" into "hard hardcore"
+    genre = re.sub(r'hard hardcore', 'hardcore')
 
     # turn "genre'n'roll" into "genre rock'n'roll"
     genre = re.sub(r'(\S+)\'n\'roll', r"\g<1> rock'n'roll", genre)
@@ -361,7 +371,7 @@ def process_concurrently(*args):
 
     q = Queue(THREAD_MAX * 2)
     for _ in range(THREAD_MAX):
-        process = Thread(target=_process_funcs_concurrently)
+        process = Process(target=_process_funcs_concurrently)
         process.daemon = True
         process.start()
 
