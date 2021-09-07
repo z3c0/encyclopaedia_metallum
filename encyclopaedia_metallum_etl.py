@@ -521,4 +521,5 @@ def download_data(bands=True, albums=False, tracks=False):
 
 
 if __name__ == '__main__':
-    download_data()
+    Output.log.disable()
+    download_data(False, True, False)
